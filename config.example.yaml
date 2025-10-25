@@ -16,15 +16,13 @@ settings:
 markets:
   cs_money:
     enabled: true
-    cookies:
-      cf_clearance: "<скопируйте значение из браузера>"
+    auto_cookies: true
     headers:
       user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     item_url_template: "https://cs.money/csgo/trade/?search={name}"
   lis_skins:
     enabled: true
-    cookies:
-      cf_clearance: "<cookie>"
+    auto_cookies: true
     headers:
       user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     page_url: "https://lis-skins.com/market/csgo"
@@ -53,3 +51,13 @@ items:
   - market_hash_name: "M4A1-S | Hyper Beast (Field-Tested)"
     min_price: 30
     min_profit: 3
+  - label: "StatTrak AK-47 (FN/MW)"
+    dynamic: true
+    search: "AK-47"
+    filters:
+      weapons: ["AK-47"]
+      wears: ["Factory New", "Minimal Wear"]
+      stattrak: true
+    markets: ["cs.money", "lis-skins.com"]
+    min_price: 20
+    min_roi: 0.1
