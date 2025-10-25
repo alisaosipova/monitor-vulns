@@ -1,0 +1,29 @@
+# Минимальный пример конфигурации для запуска мониторинга Skinport -> Steam.
+settings:
+  refresh_interval: 120
+  currency: USD
+  default_min_roi: 0.06
+  default_min_profit: 2.0
+  request_timeout: 25
+  max_displayed_deals: 10
+
+markets:
+  skinport:
+    enabled: true
+    tradable_only: true
+    currency: USD
+  steam_community:
+    enabled: true
+    count: 30
+    item_url_template: "https://steamcommunity.com/market/listings/730/{name}"
+
+items:
+  - market_hash_name: "AK-47 | Redline (Field-Tested)"
+    min_price: 10
+    min_roi: 0.05
+  - market_hash_name: "AWP | Asiimov (Field-Tested)"
+    min_price: 20
+    min_roi: 0.05
+  - market_hash_name: "M4A1-S | Printstream (Field-Tested)"
+    min_price: 15
+    min_roi: 0.05
