@@ -27,6 +27,22 @@ python deal_monitor.py -c config.yaml
 python deal_monitor.py -c config.yaml --item "name=AK-47 | Redline (Field-Tested);min_price=40;min_roi=0.06"
 ```
 
+Начиная с этой версии можно указывать только название предмета — параметры будут
+подтянуты из настроек по умолчанию:
+
+```bash
+python deal_monitor.py -c config.yaml --item "AK-47 | Redline (Field-Tested)"
+```
+
+### Быстрый старт
+
+Для Skinport и Steam подготовлен готовый пример `config.quickstart.yaml`. Его
+можно использовать без изменения, чтобы сразу увидеть работу мониторинга:
+
+```bash
+python deal_monitor.py -c config.quickstart.yaml
+```
+
 ### Возможности
 
 - Опрос маркетов каждые `refresh_interval` секунд.
