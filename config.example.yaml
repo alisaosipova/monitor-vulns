@@ -1,0 +1,46 @@
+settings:
+  refresh_interval: 60
+  currency: USD
+  steam_fee: 0.13
+  default_min_roi: 0.05
+  default_min_profit: 1.0
+  request_timeout: 25
+  verify_tls: true
+  proxies: {}
+
+markets:
+  cs_money:
+    enabled: true
+    cookies:
+      cf_clearance: "<скопируйте значение из браузера>"
+    headers:
+      user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    item_url_template: "https://cs.money/csgo/trade/?search={name}"
+  lis_skins:
+    enabled: true
+    cookies:
+      cf_clearance: "<cookie>"
+    headers:
+      user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    page_url: "https://lis-skins.com/market/csgo"
+    item_url_template: "https://lis-skins.com/market/csgo?search={name}"
+  market_csgo:
+    enabled: true
+    api_key: "${CSGO_MARKET_API_KEY}"
+    limit: 60
+    price_multiplier: 0.01
+  skinport:
+    enabled: true
+    tradable_only: true
+    currency: USD
+
+items:
+  - market_hash_name: "AK-47 | Redline (Field-Tested)"
+    min_price: 50
+    max_price: 120
+    min_roi: 0.08
+    min_profit: 5
+    markets: ["cs.money", "skinport", "market.csgo.com", "lis-skins.com"]
+  - market_hash_name: "M4A1-S | Hyper Beast (Field-Tested)"
+    min_price: 30
+    min_profit: 3
