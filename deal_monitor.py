@@ -445,29 +445,57 @@ class HTTPFetcher(MarketFetcher):
 class CloudflareFetcher(MarketFetcher):
     def __init__(self, settings: Settings, config: Optional[Dict[str, Any]] = None):
         super().__init__(settings, config)
-        browser_cfg = {
+        self._browser_cfg = {
             "browser": self.config.get("browser", "firefox"),
             "platform": self.config.get("platform", "windows"),
             "mobile": bool(self.config.get("mobile", False)),
         }
-        self.scraper = cloudscraper.create_scraper(browser=browser_cfg)
         headers = {"User-Agent": self.config.get("user_agent", DEFAULT_USER_AGENT)}
         headers.update(self.config.get("headers") or {})
-        self.scraper.headers.update(headers)
-        cookies = self.config.get("cookies")
-        if cookies:
-            self.scraper.cookies.update(cookies)
+        self._base_headers = dict(headers)
+        cookies = self.config.get("cookies") or {}
+        self._base_cookies = dict(cookies)
+        self._bootstrap_attempted = False
+        self._recreate_scraper()
         if self.config.get("auto_cookies", True):
             self._bootstrap_cookies()
 
     def request(self, method: str, url: str, **kwargs) -> Response:
         timeout = kwargs.pop("timeout", self.settings.request_timeout)
-        try:
-            return self.scraper.request(method, url, timeout=timeout, **kwargs)
-        except RequestException as exc:
-            raise RuntimeError(f"{self.name}: сетевой сбой — {exc}") from exc
+        auto_cookies = self.config.get("auto_cookies", True)
+        attempts = 2 if auto_cookies else 1
+        for attempt in range(attempts):
+            try:
+                response = self.scraper.request(method, url, timeout=timeout, **kwargs)
+            except RequestException as exc:
+                if auto_cookies and attempt + 1 < attempts:
+                    logging.debug("%s: повторная попытка после сетевой ошибки: %s", self.name, exc)
+                    self._handle_retry()
+                    continue
+                raise RuntimeError(f"{self.name}: сетевой сбой — {exc}") from exc
+            if response.status_code in {401, 403} and auto_cookies and attempt + 1 < attempts:
+                logging.debug("%s: получен статус %s, пробуем обновить cookie", self.name, response.status_code)
+                self._handle_retry()
+                continue
+            return response
+        raise RuntimeError(f"{self.name}: не удалось выполнить запрос к {url}")
 
-    def _bootstrap_cookies(self) -> None:
+    def _handle_retry(self) -> None:
+        self._recreate_scraper()
+        refreshed = self._bootstrap_cookies(force=True)
+        if not refreshed:
+            logging.debug("%s: повторное получение Cloudflare cookie не удалось", self.name)
+
+    def _recreate_scraper(self) -> None:
+        self.scraper = cloudscraper.create_scraper(browser=self._browser_cfg)
+        self.scraper.headers.update(self._base_headers)
+        if self._base_cookies:
+            self.scraper.cookies.update(self._base_cookies)
+
+    def _bootstrap_cookies(self, force: bool = False) -> bool:
+        if self._bootstrap_attempted and not force:
+            return False
+        self._bootstrap_attempted = True
         targets = self.config.get("bootstrap_urls")
         if not targets:
             targets = [
@@ -488,8 +516,9 @@ class CloudflareFetcher(MarketFetcher):
             if user_agent:
                 self.scraper.headers["User-Agent"] = user_agent
             logging.debug("%s: получены Cloudflare cookie автоматически", self.name)
-            return
+            return True
         logging.debug("%s: не удалось автоматически получить Cloudflare cookie", self.name)
+        return False
 
 
 def iter_items_by_keys(value: Any, keys: Iterable[str]):
