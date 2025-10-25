@@ -56,9 +56,18 @@ STEAM_CURRENCY_IDS: Dict[str, int] = {
     "UAH": 36,
 }
 
+DEFAULT_SCORE_WEIGHTS: Dict[str, float] = {"roi": 0.6, "profit": 0.3, "discount": 0.1}
+
 
 class ConfigError(RuntimeError):
     """Ошибки конфигурации."""
+
+
+def resolve_steam_currency_id(code: str) -> int:
+    try:
+        return STEAM_CURRENCY_IDS[code.upper()]
+    except KeyError as exc:
+        raise ConfigError(f"Валюта {code!r} не поддерживается Steam API.") from exc
 
 
 @dataclass
@@ -71,6 +80,10 @@ class Settings:
     request_timeout: float = 25.0
     verify_tls: bool = True
     proxies: Dict[str, str] = field(default_factory=dict)
+    deal_score_weights: Dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_SCORE_WEIGHTS)
+    )
+    max_displayed_deals: Optional[int] = None
 
 
 @dataclass
@@ -115,6 +128,8 @@ class Deal:
     target_sell_price: float
     profit: float
     roi: float
+    discount: float
+    score: float
 
     @property
     def market(self) -> str:
@@ -204,10 +219,7 @@ class SteamMarketClient:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        currency_id = STEAM_CURRENCY_IDS.get(settings.currency.upper())
-        if currency_id is None:
-            raise ConfigError(f"Валюта {settings.currency!r} не поддерживается Steam API.")
-        self.currency_id = currency_id
+        self.currency_id = resolve_steam_currency_id(settings.currency)
         self.session = create_retry_session(settings.verify_tls, settings.proxies)
         self.session.headers.update(
             {
@@ -412,6 +424,65 @@ class CSGOMarketFetcher(HTTPFetcher):
                         "phase": entry.get("phase"),
                     },
                     raw=entry,
+                )
+            )
+        return offers
+
+
+class SteamCommunityFetcher(HTTPFetcher):
+    name = "steamcommunity.com"
+    LISTING_URL = "https://steamcommunity.com/market/listings/730/{name}/render"
+
+    def __init__(self, settings: Settings, config: Optional[Dict[str, Any]] = None):
+        super().__init__(settings, config)
+        self.currency_id = resolve_steam_currency_id(self.config.get("currency", settings.currency))
+
+    def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
+        market_name = query.name_for(self.name)
+        if not market_name:
+            return []
+        params = {
+            "start": self.config.get("start", 0),
+            "count": self.config.get("count", 20),
+            "currency": self.currency_id,
+            "format": "json",
+        }
+        url = self.LISTING_URL.format(name=urllib.parse.quote(market_name))
+        response = self.session.get(url, params=params, timeout=self.settings.request_timeout)
+        if response.status_code == 429:
+            raise RuntimeError("steamcommunity.com: получен 429 (превышен лимит запросов)")
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("steamcommunity.com: некорректный JSON") from exc
+        if not data.get("success", True):
+            return []
+        listinginfo = data.get("listinginfo") or {}
+        offers: List[MarketOffer] = []
+        for listing_id, info in listinginfo.items():
+            base_cents = coerce_int(info.get("converted_price_per_unit") or info.get("converted_price"))
+            fee_cents = coerce_int(info.get("converted_fee_per_unit") or info.get("converted_fee") or 0)
+            if base_cents is None:
+                continue
+            total_cents = base_cents + (fee_cents or 0)
+            price = self.adjust_price(total_cents / 100.0)
+            offers.append(
+                MarketOffer(
+                    self.name,
+                    str(listing_id),
+                    query.market_hash_name,
+                    price,
+                    self.config.get(
+                        "item_url_template",
+                        "https://steamcommunity.com/market/listings/730/{name}",
+                    ).format(name=urllib.parse.quote(market_name)),
+                    quantity=coerce_int(info.get("quantity")),
+                    extra={
+                        "original_amount": info.get("original_amount"),
+                        "asset": info.get("asset"),
+                    },
+                    raw=info,
                 )
             )
         return offers
@@ -626,7 +697,7 @@ class DealMonitor:
                         key = f"{deal.market}:{deal.offer.offer_id}"
                         self.last_seen[key] = time.time()
                         deals.append(deal)
-        deals.sort(key=lambda d: (d.roi, d.profit), reverse=True)
+        deals.sort(key=lambda d: (d.score, d.roi, d.profit), reverse=True)
         now = time.time()
         for key, ts in list(self.last_seen.items()):
             if now - ts > self.settings.refresh_interval * 3:
@@ -650,7 +721,15 @@ class DealMonitor:
             return None
         if sell_after_fee <= 0:
             return None
-        return Deal(query, offer, steam_quote, target_price, profit, roi)
+        discount = (target_price - offer.price) / target_price if target_price else 0.0
+        weights = self.settings.deal_score_weights
+        profit_norm = profit / target_price if target_price else 0.0
+        score = (
+            weights.get("roi", 0.0) * roi
+            + weights.get("profit", 0.0) * profit_norm
+            + weights.get("discount", 0.0) * discount
+        )
+        return Deal(query, offer, steam_quote, target_price, profit, roi, discount, score)
 
     def render(self, deals: Sequence[Deal], quotes: Dict[str, SteamQuote], errors: Sequence[str]) -> None:
         console.clear()
@@ -662,10 +741,14 @@ class DealMonitor:
         table.add_column("Продажа (Steam)", justify="right")
         table.add_column("Прибыль", justify="right")
         table.add_column("ROI", justify="right")
+        table.add_column("Скидка", justify="right")
+        table.add_column("Счёт", justify="right")
         table.add_column("Ссылка", overflow="fold")
-        if not deals:
-            table.add_row("—", "Нет выгодных предложений", "—", "—", "—", "—", "—")
-        for deal in deals:
+        max_deals = self.settings.max_displayed_deals
+        display_deals = deals[:max_deals] if max_deals else deals
+        if not display_deals:
+            table.add_row("—", "Нет выгодных предложений", "—", "—", "—", "—", "—", "—", "—")
+        for deal in display_deals:
             table.add_row(
                 deal.market,
                 deal.item.market_hash_name,
@@ -673,9 +756,18 @@ class DealMonitor:
                 format_money(deal.target_sell_price, self.settings.currency),
                 format_money(deal.profit, self.settings.currency, signed=True),
                 f"{deal.roi * 100:+.2f}%",
+                f"{deal.discount * 100:+.2f}%",
+                f"{deal.score:.3f}",
                 deal.offer.url,
             )
         console.print(table)
+        if max_deals and len(deals) > len(display_deals):
+            console.print(
+                Panel(
+                    f"Показаны топ {len(display_deals)} из {len(deals)} предложений по счёту.",
+                    style="cyan",
+                )
+            )
         steam_table = Table(title="Steam показатели", box=box.SIMPLE_HEAD)
         steam_table.add_column("Предмет")
         steam_table.add_column("Median", justify="right")
@@ -695,6 +787,21 @@ class DealMonitor:
 
 def build_settings(raw: Dict[str, Any], overrides: argparse.Namespace) -> Settings:
     data = raw.get("settings", {})
+    weights_cfg = data.get("deal_score_weights") or {}
+    score_weights = dict(DEFAULT_SCORE_WEIGHTS)
+    for key, value in weights_cfg.items():
+        try:
+            score_weights[key] = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"deal_score_weights.{key} должно быть числом") from exc
+    max_deals_raw = data.get("max_displayed_deals")
+    max_displayed_deals = (
+        int(max_deals_raw)
+        if max_deals_raw not in (None, "", "none", "null")
+        else None
+    )
+    if max_displayed_deals is not None and max_displayed_deals <= 0:
+        max_displayed_deals = None
     settings = Settings(
         refresh_interval=int(data.get("refresh_interval", 60)),
         currency=(data.get("currency") or "USD").upper(),
@@ -704,6 +811,8 @@ def build_settings(raw: Dict[str, Any], overrides: argparse.Namespace) -> Settin
         request_timeout=float(data.get("request_timeout", 25.0)),
         verify_tls=bool(data.get("verify_tls", True)),
         proxies=data.get("proxies") or {},
+        deal_score_weights=score_weights,
+        max_displayed_deals=max_displayed_deals,
     )
     if overrides.refresh:
         settings.refresh_interval = overrides.refresh
@@ -796,6 +905,7 @@ def build_fetchers(settings: Settings, markets_cfg: Dict[str, Any]) -> List[Mark
         (LisSkinsFetcher, "lis_skins"),
         (CSGOMarketFetcher, "market_csgo"),
         (SkinportFetcher, "skinport"),
+        (SteamCommunityFetcher, "steam_community"),
     ]
     for cls, key in registry:
         cfg = markets_cfg.get(key, {})
