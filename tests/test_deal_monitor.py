@@ -1,4 +1,5 @@
 import argparse
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -16,7 +17,10 @@ from deal_monitor import (
     MarketFetcher,
     MarketOffer,
     Settings,
+    CSGOMarketFetcher,
+    LisSkinsFetcher,
     SkinportFetcher,
+    SteamCommunityFetcher,
     SteamQuote,
     SteamMarketClient,
     build_item_query,
@@ -319,43 +323,209 @@ def test_parse_cli_item_accepts_plain_name_expression():
     assert query.min_profit == 1.8
 
 
-def test_live_skinport_snapshot_prints_real_skins():
-    settings = Settings(currency="USD")
+def test_csgo_market_fetcher_parses_embedded_json(monkeypatch):
+    settings = Settings()
+    fetcher = CSGOMarketFetcher(settings)
+
+    payload = {
+        "apollo.cache.state": {
+            "ROOT_QUERY": {
+                "viewItem({\"market_hash_name\":\"AK-47 | Redline (Field-Tested)\"})": {
+                    "__ref": "ItemType:123"
+                }
+            },
+            "ItemType:123": {
+                "offersConnection": {
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "offer-1",
+                                "price": {"amount": "12.34", "currency": "USD"},
+                                "market_hash_name": "AK-47 | Redline (Field-Tested)",
+                                "url": "https://market.csgo.com/item/AK-47%20%7C%20Redline%20(Field-Tested)",
+                                "quantity": 2,
+                                "float": 0.1234,
+                            }
+                        }
+                    ]
+                }
+            },
+        }
+    }
+
+    html = f"<html><body><script>{json.dumps(payload)}</script></body></html>"
+
+    class DummyResponse:
+        def __init__(self, text: str, status_code: int = 200):
+            self.text = text
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError("HTTP error")
+
+    def fake_get(url, timeout=None):
+        return DummyResponse(html)
+
+    monkeypatch.setattr(fetcher.session, "get", fake_get)
+
+    query = ItemQuery(market_hash_name="AK-47 | Redline (Field-Tested)")
+    offers = fetcher.fetch_offers(query)
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer.market == fetcher.name
+    assert offer.price == 12.34
+    assert offer.market_hash_name == "AK-47 | Redline (Field-Tested)"
+    assert offer.url.endswith("AK-47%20%7C%20Redline%20(Field-Tested)")
+
+
+def test_skinport_fetcher_parses_embedded_json(monkeypatch):
+    settings = Settings()
     fetcher = SkinportFetcher(settings)
-    steam_client = SteamMarketClient(settings)
-    candidates = [
-        "AK-47 | Redline (Field-Tested)",
-        "AWP | Asiimov (Field-Tested)",
-        "M4A1-S | Printstream (Field-Tested)",
-        "Desert Eagle | Printstream (Minimal Wear)",
-        "AK-47 | Vulcan (Field-Tested)",
-    ]
-    deals = []
-    for name in candidates:
-        offers = fetcher.fetch_offers(ItemQuery(market_hash_name=name))
-        if not offers:
-            continue
-        cheapest = min(offers, key=lambda offer: offer.price)
-        # Избегаем ограничения по частоте запросов Steam.
-        time.sleep(1.5)
-        quote = steam_client.fetch(name)
-        if quote is None or quote.median_price is None:
-            continue
-        discount = quote.median_price - cheapest.price
-        if discount <= 0:
-            continue
-        deals.append((name, cheapest, quote, discount))
-    assert deals, "Skinport не вернул выгодных офферов для выбранных предметов"
-    deals.sort(key=lambda entry: entry[3], reverse=True)
-    lines = ["Live Skinport snapshot (Skinport -> Steam median discount):"]
-    for name, offer, quote, discount in deals[:3]:
-        lines.append(
-            f"{name}: Skinport {offer.price:.2f} USD vs Steam {quote.median_price:.2f} USD "
-            f"(discount {discount:.2f} USD) — {offer.url}"
-        )
-    for line in lines:
-        print(line)
-    assert any("https://skinport.com" in line for line in lines[1:])
+
+    payload = {
+        "state": {
+            "items": [
+                {
+                    "id": "offer-1",
+                    "price": {"amount": "12.34"},
+                    "market_hash_name": "AK-47 | Redline (Field-Tested)",
+                    "url": "https://skinport.com/item/ak-47-redline",
+                    "quantity": 3,
+                    "float": 0.1234,
+                }
+            ]
+        }
+    }
+
+    html = f"<html><body><script>window.__NUXT__ = {json.dumps(payload)};</script></body></html>"
+
+    class DummyResponse:
+        def __init__(self, text: str, status_code: int = 200):
+            self.text = text
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError("HTTP error")
+
+    def fake_get(url, timeout=None):
+        return DummyResponse(html)
+
+    monkeypatch.setattr(fetcher.session, "get", fake_get)
+
+    query = ItemQuery(market_hash_name="AK-47 | Redline (Field-Tested)")
+    offers = fetcher.fetch_offers(query)
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer.market == fetcher.name
+    assert offer.price == 12.34
+    assert offer.market_hash_name == "AK-47 | Redline (Field-Tested)"
+    assert offer.url == "https://skinport.com/item/ak-47-redline"
+    assert offer.extra["float"] == 0.1234
+    assert offer.quantity == 3
+
+
+def test_steam_community_fetcher_parses_listing_page(monkeypatch):
+    settings = Settings(currency="USD")
+    fetcher = SteamCommunityFetcher(settings)
+
+    listing_info = {
+        "6413": {
+            "converted_price_per_unit": 3914,
+            "converted_fee_per_unit": 586,
+            "asset": {"appid": 730, "contextid": "2", "id": "471295"},
+            "quantity": "2",
+        }
+    }
+    assets = {
+        "730": {
+            "2": {
+                "471295": {
+                    "id": "471295",
+                    "market_hash_name": "AK-47 | Redline (Field-Tested)",
+                }
+            }
+        }
+    }
+    html = (
+        "<html><body>"
+        f"<script>var g_rgListingInfo = {json.dumps(listing_info)};</script>"
+        f"<script>g_rgAssets = {json.dumps(assets)};</script>"
+        "</body></html>"
+    )
+
+    class DummyResponse:
+        def __init__(self, text: str, status_code: int = 200):
+            self.text = text
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError("HTTP error")
+
+    def fake_get(url, params=None, timeout=None):
+        assert params and params.get("currency") == fetcher.currency_id
+        return DummyResponse(html)
+
+    monkeypatch.setattr(fetcher.session, "get", fake_get)
+
+    query = ItemQuery(market_hash_name="AK-47 | Redline (Field-Tested)")
+    offers = fetcher.fetch_offers(query)
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer.market == fetcher.name
+    assert offer.market_hash_name == "AK-47 | Redline (Field-Tested)"
+    assert offer.price == pytest.approx((3914 + 586) / 100.0)
+    assert offer.extra["asset"]["market_hash_name"] == "AK-47 | Redline (Field-Tested)"
+
+
+def test_lis_skins_fetcher_parses_embedded_json(monkeypatch):
+    settings = Settings()
+    fetcher = LisSkinsFetcher(settings)
+
+    payload = {
+        "props": {
+            "pageProps": {
+                "items": [
+                    {
+                        "id": "lis-offer-1",
+                        "price": "15.75",
+                        "market_hash_name": "AK-47 | Redline (Field-Tested)",
+                    }
+                ]
+            }
+        }
+    }
+    html = (
+        '<html><body><script id="__NEXT_DATA__" type="application/json">'
+        f'{json.dumps(payload)}'
+        '</script></body></html>'
+    )
+
+    class DummyResponse:
+        def __init__(self, text: str, status_code: int = 200):
+            self.text = text
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError("HTTP error")
+
+    def fake_request(method, url, params=None):
+        assert method == "GET"
+        return DummyResponse(html)
+
+    monkeypatch.setattr(fetcher, "request", fake_request)
+
+    query = ItemQuery(market_hash_name="AK-47 | Redline (Field-Tested)")
+    offers = fetcher.fetch_offers(query)
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer.price == 15.75
+    assert "AK-47%20%7C%20Redline%20%28Field-Tested%29" in offer.url
+
+
 
 
 class DummyFetcher(MarketFetcher):

@@ -19,7 +19,8 @@ markets:
     auto_cookies: true
     headers:
       user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    item_url_template: "https://cs.money/csgo/trade/?search={name}"
+    page_url: "https://cs.money/market/csgo"
+    item_url_template: "https://cs.money/market/csgo?search={name}"
   lis_skins:
     enabled: true
     auto_cookies: true
@@ -29,16 +30,13 @@ markets:
     item_url_template: "https://lis-skins.com/market/csgo?search={name}"
   market_csgo:
     enabled: true
-    api_key: "${CSGO_MARKET_API_KEY}"
-    limit: 60
-    price_multiplier: 0.01
+    price_multiplier: 1.0
   skinport:
     enabled: true
-    tradable_only: true
-    currency: USD
+    search_url_template: "https://skinport.com/market/csgo?search={name}"
+    item_url_template: "https://skinport.com/market/csgo?search={name}"
   steam_community:
     enabled: true
-    count: 30
     item_url_template: "https://steamcommunity.com/market/listings/730/{name}"
 
 items:
