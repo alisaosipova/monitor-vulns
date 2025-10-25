@@ -86,6 +86,107 @@ class Settings:
     max_displayed_deals: Optional[int] = None
 
 
+WEAR_ALIASES: Dict[str, str] = {
+    "fn": "Factory New",
+    "factory new": "Factory New",
+    "minimal wear": "Minimal Wear",
+    "mw": "Minimal Wear",
+    "field-tested": "Field-Tested",
+    "ft": "Field-Tested",
+    "well-worn": "Well-Worn",
+    "ww": "Well-Worn",
+    "battle-scarred": "Battle-Scarred",
+    "bs": "Battle-Scarred",
+}
+
+
+def normalize_wear(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return None
+    return WEAR_ALIASES.get(cleaned, value.strip())
+
+
+def normalize_weapon(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
+@dataclass(frozen=True)
+class ItemAttributes:
+    original_name: str
+    weapon: Optional[str]
+    skin: Optional[str]
+    wear: Optional[str]
+    stattrak: bool
+    souvenir: bool
+
+
+def parse_market_hash_name(name: Optional[str]) -> ItemAttributes:
+    source = (name or "").strip()
+    stattrak = source.startswith("StatTrak™ ")
+    if stattrak:
+        source = source[len("StatTrak™ ") :]
+    souvenir = source.startswith("Souvenir ")
+    if souvenir:
+        source = source[len("Souvenir ") :]
+    source = source.lstrip("★ ").strip()
+    weapon: Optional[str] = None
+    skin: Optional[str] = None
+    wear: Optional[str] = None
+    if " | " in source:
+        weapon, rest = source.split(" | ", 1)
+        weapon = weapon.strip() or None
+    else:
+        rest = source
+    rest = rest.strip()
+    if rest.endswith(")") and "(" in rest:
+        base, wear_part = rest.rsplit("(", 1)
+        skin = base.strip() or None
+        wear = normalize_wear(wear_part[:-1])
+    else:
+        skin = rest or None
+    return ItemAttributes(name or "", weapon, skin, wear, stattrak, souvenir)
+
+
+def to_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [value]
+    result: List[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def to_string_set(value: Any) -> Set[str]:
+    return set(to_string_list(value))
+
+
+def parse_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ConfigError(f"Не удалось интерпретировать логическое значение: {value!r}")
+
+
 @dataclass
 class ItemQuery:
     market_hash_name: str
@@ -95,9 +196,66 @@ class ItemQuery:
     min_profit: float = 1.0
     watch_markets: Optional[Set[str]] = None
     aliases: Dict[str, str] = field(default_factory=dict)
+    search_term: Optional[str] = None
+    steam_name: Optional[str] = None
+    exact_name: bool = True
+    dynamic: bool = False
+    wear_filters: Set[str] = field(default_factory=set)
+    weapon_filters: Set[str] = field(default_factory=set)
+    stattrak: Optional[bool] = None
+    souvenir: Optional[bool] = None
+    include_keywords: Set[str] = field(default_factory=set)
+    exclude_keywords: Set[str] = field(default_factory=set)
 
     def name_for(self, market: str) -> str:
+        if market == "steam":
+            if self.steam_name is not None:
+                return self.steam_name
+            if "steam" in self.aliases:
+                return self.aliases["steam"]
         return self.aliases.get(market, self.market_hash_name)
+
+    def search_for(self, market: str) -> str:
+        if market in self.aliases:
+            return self.aliases[market]
+        if self.search_term and market != "steam":
+            return self.search_term
+        return self.market_hash_name
+
+    def matches_search(self, candidate: str, market: str) -> bool:
+        if self.exact_name:
+            return candidate == self.search_for(market).lower()
+        term = self.search_for(market).lower()
+        return not term or term in candidate
+
+    def resolve_steam_name(self, offer: "MarketOffer") -> Optional[str]:
+        if self.dynamic:
+            return offer.market_hash_name or self.name_for("steam")
+        return self.name_for("steam")
+
+    def matches_offer(self, offer: "MarketOffer") -> bool:
+        attrs = parse_market_hash_name(offer.market_hash_name)
+        if self.weapon_filters and (
+            attrs.weapon is None or attrs.weapon.lower() not in self.weapon_filters
+        ):
+            return False
+        if self.wear_filters and (
+            attrs.wear is None or attrs.wear not in self.wear_filters
+        ):
+            return False
+        if self.stattrak is not None and attrs.stattrak != self.stattrak:
+            return False
+        if self.souvenir is not None and attrs.souvenir != self.souvenir:
+            return False
+        name_lower = attrs.original_name.lower()
+        if self.include_keywords and not all(k in name_lower for k in self.include_keywords):
+            return False
+        if any(k in name_lower for k in self.exclude_keywords):
+            return False
+        if self.exact_name and not self.dynamic:
+            expected = self.name_for("steam").lower()
+            return not expected or name_lower == expected
+        return True
 
 
 @dataclass
@@ -253,6 +411,7 @@ class SteamMarketClient:
 
 class MarketFetcher:
     name: str = "abstract"
+    supports_dynamic: bool = False
 
     def __init__(self, settings: Settings, config: Optional[Dict[str, Any]] = None):
         self.settings = settings
@@ -296,6 +455,8 @@ class CloudflareFetcher(MarketFetcher):
         cookies = self.config.get("cookies")
         if cookies:
             self.scraper.cookies.update(cookies)
+        if self.config.get("auto_cookies", True):
+            self._bootstrap_cookies()
 
     def request(self, method: str, url: str, **kwargs) -> Response:
         timeout = kwargs.pop("timeout", self.settings.request_timeout)
@@ -303,6 +464,30 @@ class CloudflareFetcher(MarketFetcher):
             return self.scraper.request(method, url, timeout=timeout, **kwargs)
         except RequestException as exc:
             raise RuntimeError(f"{self.name}: сетевой сбой — {exc}") from exc
+
+    def _bootstrap_cookies(self) -> None:
+        targets = self.config.get("bootstrap_urls")
+        if not targets:
+            targets = [
+                self.config.get("page_url"),
+                self.config.get("api_url"),
+                self.config.get("base_url"),
+            ]
+        for target in targets:
+            if not target:
+                continue
+            try:
+                tokens, user_agent = self.scraper.get_tokens(target)
+            except Exception as exc:
+                logging.debug("%s: auto-cookie update failed for %s: %s", self.name, target, exc)
+                continue
+            if tokens:
+                self.scraper.cookies.update(tokens)
+            if user_agent:
+                self.scraper.headers["User-Agent"] = user_agent
+            logging.debug("%s: получены Cloudflare cookie автоматически", self.name)
+            return
+        logging.debug("%s: не удалось автоматически получить Cloudflare cookie", self.name)
 
 
 def iter_items_by_keys(value: Any, keys: Iterable[str]):
@@ -328,7 +513,7 @@ class SkinportFetcher(HTTPFetcher):
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
         params = {
             "app_id": 730,
-            "market_hash_name": query.name_for(self.name),
+            "market_hash_name": query.search_for(self.name),
             "currency": self.config.get("currency", self.settings.currency),
         }
         if self.config.get("tradable_only", True):
@@ -342,10 +527,13 @@ class SkinportFetcher(HTTPFetcher):
             raise RuntimeError(f"Skinport: {data['errors']}")
         items = data if isinstance(data, list) else [data]
         offers: List[MarketOffer] = []
-        target = query.name_for(self.name).lower()
+        target = query.search_for(self.name).lower()
         for entry in items:
-            name = (entry.get("market_hash_name") or entry.get("market_name") or "").lower()
-            if name and name != target:
+            raw_name = entry.get("market_hash_name") or entry.get("market_name") or ""
+            name = raw_name.lower()
+            if query.exact_name and name and name != target:
+                continue
+            if not query.exact_name and target and target not in name:
                 continue
             price = coerce_float(entry.get("min_price") or entry.get("price"))
             if price is None:
@@ -353,13 +541,13 @@ class SkinportFetcher(HTTPFetcher):
             adjusted = self.adjust_price(price)
             offer_id = str(entry.get("item_id") or entry.get("market_hash_name"))
             url = self.config.get("item_url_template", "https://skinport.com/item/{name}").format(
-                name=urllib.parse.quote(query.name_for(self.name))
+                name=urllib.parse.quote(query.search_for(self.name))
             )
             offers.append(
                 MarketOffer(
                     self.name,
                     offer_id,
-                    query.market_hash_name,
+                    raw_name or query.market_hash_name,
                     adjusted,
                     url,
                     quantity=entry.get("quantity"),
@@ -415,7 +603,7 @@ class CSGOMarketFetcher(HTTPFetcher):
                 MarketOffer(
                     self.name,
                     offer_id,
-                    query.market_hash_name,
+                    entry.get("market_hash_name") or query.market_hash_name,
                     adjusted,
                     url,
                     quantity=entry.get("count") or entry.get("amount") or entry.get("total"),
@@ -467,11 +655,18 @@ class SteamCommunityFetcher(HTTPFetcher):
                 continue
             total_cents = base_cents + (fee_cents or 0)
             price = self.adjust_price(total_cents / 100.0)
+            asset = info.get("asset") or {}
+            raw_name = (
+                asset.get("market_hash_name")
+                or asset.get("market_name")
+                or asset.get("name")
+                or query.market_hash_name
+            )
             offers.append(
                 MarketOffer(
                     self.name,
                     str(listing_id),
-                    query.market_hash_name,
+                    raw_name,
                     price,
                     self.config.get(
                         "item_url_template",
@@ -490,10 +685,11 @@ class SteamCommunityFetcher(HTTPFetcher):
 
 class LisSkinsFetcher(CloudflareFetcher):
     name = "lis-skins.com"
+    supports_dynamic = True
 
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
         page_url = self.config.get("page_url", "https://lis-skins.com/market/csgo")
-        params = {"search": query.name_for(self.name)}
+        params = {"search": query.search_for(self.name)}
         response = self.request("GET", page_url, params=params)
         if response.status_code != 200:
             raise RuntimeError(f"lis-skins.com вернул {response.status_code}")
@@ -512,11 +708,11 @@ class LisSkinsFetcher(CloudflareFetcher):
             if isinstance(candidate, list):
                 items.extend(candidate)
         offers: List[MarketOffer] = []
-        needle = query.name_for(self.name).lower()
         seen: Set[str] = set()
         for entry in items:
-            name = (entry.get("market_hash_name") or entry.get("fullName") or entry.get("name") or "").lower()
-            if needle not in name:
+            raw_name = entry.get("market_hash_name") or entry.get("fullName") or entry.get("name") or ""
+            name = raw_name.lower()
+            if not query.matches_search(name, self.name):
                 continue
             price_value = entry.get("price") or entry.get("priceUsd") or entry.get("min_price")
             price = coerce_float(price_value)
@@ -537,12 +733,12 @@ class LisSkinsFetcher(CloudflareFetcher):
             url = self.config.get(
                 "item_url_template",
                 "https://lis-skins.com/market/csgo?search={name}",
-            ).format(name=urllib.parse.quote(query.name_for(self.name)))
+            ).format(name=urllib.parse.quote(query.search_for(self.name)))
             offers.append(
                 MarketOffer(
                     self.name,
                     offer_id,
-                    query.market_hash_name,
+                    raw_name or query.market_hash_name,
                     adjusted,
                     url,
                     quantity=entry.get("count") or entry.get("quantity") or entry.get("available"),
@@ -558,6 +754,7 @@ class LisSkinsFetcher(CloudflareFetcher):
 
 class CSMoneyFetcher(CloudflareFetcher):
     name = "cs.money"
+    supports_dynamic = True
 
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
         if api_url := self.config.get("api_url"):
@@ -570,7 +767,7 @@ class CSMoneyFetcher(CloudflareFetcher):
             "offset": 0,
             "sort": self.config.get("sort", "price"),
             "order": self.config.get("order", "asc"),
-            "search": query.name_for(self.name),
+            "search": query.search_for(self.name),
         }
         response = self.request("GET", url, params=params)
         if response.status_code != 200:
@@ -581,7 +778,7 @@ class CSMoneyFetcher(CloudflareFetcher):
 
     def _fetch_via_page(self, query: ItemQuery) -> List[MarketOffer]:
         page_url = self.config.get("page_url", "https://cs.money/csgo/trade")
-        params = {"search": query.name_for(self.name)}
+        params = {"search": query.search_for(self.name)}
         response = self.request("GET", page_url, params=params)
         if response.status_code != 200:
             raise RuntimeError(f"cs.money страница вернула {response.status_code}")
@@ -603,11 +800,11 @@ class CSMoneyFetcher(CloudflareFetcher):
 
     def _parse_items(self, items: List[Dict[str, Any]], query: ItemQuery) -> List[MarketOffer]:
         offers: List[MarketOffer] = []
-        target = query.name_for(self.name).lower()
         seen: Set[str] = set()
         for entry in items:
-            name = (entry.get("market_hash_name") or entry.get("fullName") or entry.get("name") or "").lower()
-            if target not in name:
+            raw_name = entry.get("market_hash_name") or entry.get("fullName") or entry.get("name") or ""
+            name = raw_name.lower()
+            if not query.matches_search(name, self.name):
                 continue
             price_value = (
                 entry.get("price")
@@ -638,7 +835,7 @@ class CSMoneyFetcher(CloudflareFetcher):
                 MarketOffer(
                     self.name,
                     offer_id,
-                    query.market_hash_name,
+                    raw_name or query.market_hash_name,
                     adjusted,
                     url,
                     quantity=entry.get("count") or entry.get("available") or entry.get("amount"),
@@ -658,6 +855,7 @@ class DealMonitor:
         self.fetchers = list(fetchers)
         self.steam_client = steam_client
         self.last_seen: Dict[str, float] = {}
+        self._dynamic_skip_notified: Set[str] = set()
 
     def run(self, queries: Sequence[ItemQuery]) -> None:
         console.print(f"[bold]Старт мониторинга — {len(queries)} предмет(ов)[/bold]")
@@ -676,14 +874,26 @@ class DealMonitor:
         deals: List[Deal] = []
         quotes: Dict[str, SteamQuote] = {}
         errors: List[str] = []
+        missing_quotes: Set[str] = set()
         for query in queries:
-            steam_quote = self.steam_client.fetch(query.name_for("steam"))
-            if steam_quote is None:
-                errors.append(f"Steam: нет цены для {query.market_hash_name}")
-                continue
-            quotes[query.market_hash_name] = steam_quote
+            base_steam_name: Optional[str] = None
+            if not query.dynamic:
+                base_steam_name = query.name_for("steam")
+                if base_steam_name and base_steam_name not in quotes:
+                    steam_quote = self.steam_client.fetch(base_steam_name)
+                    if steam_quote is None:
+                        if base_steam_name not in missing_quotes:
+                            errors.append(f"Steam: нет цены для {base_steam_name}")
+                            missing_quotes.add(base_steam_name)
+                        continue
+                    quotes[base_steam_name] = steam_quote
             for fetcher in self.fetchers:
                 if query.watch_markets and fetcher.name not in query.watch_markets:
+                    continue
+                if query.dynamic and not getattr(fetcher, "supports_dynamic", False):
+                    if fetcher.name not in self._dynamic_skip_notified:
+                        errors.append(f"{fetcher.name}: динамические фильтры не поддерживаются, пропуск")
+                        self._dynamic_skip_notified.add(fetcher.name)
                     continue
                 try:
                     offers = fetcher.fetch_offers(query)
@@ -692,6 +902,20 @@ class DealMonitor:
                     errors.append(f"{fetcher.name}: {exc}")
                     continue
                 for offer in offers:
+                    if not query.matches_offer(offer):
+                        continue
+                    steam_name = query.resolve_steam_name(offer)
+                    if not steam_name:
+                        continue
+                    steam_quote = quotes.get(steam_name)
+                    if steam_quote is None:
+                        steam_quote = self.steam_client.fetch(steam_name)
+                        if steam_quote is None:
+                            if steam_name not in missing_quotes:
+                                errors.append(f"Steam: нет цены для {steam_name}")
+                                missing_quotes.add(steam_name)
+                            continue
+                        quotes[steam_name] = steam_quote
                     deal = self.evaluate_offer(query, steam_quote, offer)
                     if deal:
                         key = f"{deal.market}:{deal.offer.offer_id}"
@@ -751,7 +975,7 @@ class DealMonitor:
         for deal in display_deals:
             table.add_row(
                 deal.market,
-                deal.item.market_hash_name,
+                deal.offer.market_hash_name or deal.item.market_hash_name,
                 format_money(deal.offer.price, self.settings.currency),
                 format_money(deal.target_sell_price, self.settings.currency),
                 format_money(deal.profit, self.settings.currency, signed=True),
@@ -826,9 +1050,19 @@ def build_settings(raw: Dict[str, Any], overrides: argparse.Namespace) -> Settin
 
 
 def build_item_query(item: Dict[str, Any], settings: Settings) -> ItemQuery:
-    name = item.get("market_hash_name") or item.get("name")
-    if not name:
-        raise ConfigError("Каждый предмет должен иметь поле market_hash_name.")
+    filters_cfg = item.get("filters") or {}
+
+    def get_filter_value(*keys: str) -> Any:
+        for key in keys:
+            if key in filters_cfg:
+                return filters_cfg[key]
+        for key in keys:
+            if key in item:
+                return item[key]
+        return None
+
+    base_name = item.get("market_hash_name") or item.get("name")
+    search_term = item.get("search") or filters_cfg.get("search")
     min_price = float(item.get("min_price", 0.0) or 0.0)
     max_price_raw = item.get("max_price")
     max_price = float(max_price_raw) if max_price_raw not in (None, "", "none") else None
@@ -837,14 +1071,75 @@ def build_item_query(item: Dict[str, Any], settings: Settings) -> ItemQuery:
     markets = item.get("markets")
     watch_markets = {m.strip() for m in markets} if isinstance(markets, (list, set, tuple)) else None
     aliases = item.get("aliases") or {}
+    wear_values = to_string_list(get_filter_value("wears", "wear", "quality", "qualities"))
+    wear_filters = {normalize_wear(v) for v in wear_values if normalize_wear(v)}
+    weapon_values_raw = to_string_list(get_filter_value("weapons", "weapon"))
+    weapon_filters: Set[str] = set()
+    for value in weapon_values_raw:
+        normalized = normalize_weapon(value)
+        if normalized:
+            weapon_filters.add(normalized.lower())
+    try:
+        stattrak = parse_optional_bool(get_filter_value("stattrak", "stat_trak", "is_stattrak"))
+        souvenir = parse_optional_bool(get_filter_value("souvenir", "souvenir_only"))
+    except ConfigError as exc:
+        raise ConfigError(f"{exc} для предмета {base_name or item}") from exc
+    include_keywords = {kw.lower() for kw in to_string_list(get_filter_value("contains", "include", "keywords"))}
+    exclude_keywords = {kw.lower() for kw in to_string_list(get_filter_value("exclude", "excludes", "without"))}
+    if not search_term:
+        search_term = base_name
+    if not search_term and weapon_values_raw:
+        search_term = weapon_values_raw[0]
+    dynamic = bool(item.get("dynamic", False))
+    if not base_name:
+        dynamic = True
+    if dynamic and search_term is None:
+        raise ConfigError("Для динамического запроса требуется указать search или weapon/filters.")
+    if base_name is None and not dynamic:
+        raise ConfigError("Каждый предмет должен иметь market_hash_name или быть динамическим фильтром.")
+    if search_term is None:
+        search_term = base_name or ""
+    label = item.get("label") or base_name
+    if not label:
+        label_parts: List[str] = []
+        if stattrak is True:
+            label_parts.append("StatTrak")
+        elif stattrak is False:
+            label_parts.append("Non-StatTrak")
+        if souvenir:
+            label_parts.append("Souvenir")
+        if weapon_values_raw:
+            label_parts.append(", ".join(weapon_values_raw))
+        if wear_filters:
+            label_parts.append("/".join(sorted(wear_filters)))
+        if not label_parts and search_term:
+            label_parts.append(str(search_term))
+        label = " | ".join(label_parts) if label_parts else "Запрос"
+    if "exact_name" in item:
+        exact_name = bool(item.get("exact_name"))
+    else:
+        exact_name = not dynamic
+    steam_name = item.get("steam_name")
+    if steam_name is None and not dynamic:
+        steam_name = aliases.get("steam", base_name)
     return ItemQuery(
-        market_hash_name=name,
+        market_hash_name=label,
         min_price=min_price,
         max_price=max_price,
         min_roi=min_roi,
         min_profit=min_profit,
         watch_markets=watch_markets,
         aliases=aliases,
+        search_term=search_term,
+        steam_name=steam_name,
+        exact_name=exact_name,
+        dynamic=dynamic,
+        wear_filters={w for w in wear_filters if w},
+        weapon_filters={w for w in weapon_filters if w},
+        stattrak=stattrak,
+        souvenir=souvenir,
+        include_keywords=include_keywords,
+        exclude_keywords=exclude_keywords,
     )
 
 
@@ -859,8 +1154,6 @@ def parse_cli_item(expr: str, settings: Settings) -> ItemQuery:
         key, value = chunk.split("=", 1)
         parts[key.strip()] = value.strip()
     name = parts.pop("name", None)
-    if not name:
-        raise ConfigError("--item должен содержать как минимум name=...")
     min_price = float(parts.pop("min_price", 0.0) or 0.0)
     max_price_raw = parts.pop("max_price", None)
     max_price = float(max_price_raw) if max_price_raw not in (None, "", "none") else None
@@ -873,16 +1166,66 @@ def parse_cli_item(expr: str, settings: Settings) -> ItemQuery:
         if key.startswith("alias:"):
             market = key.split(":", 1)[1]
             aliases[market] = parts.pop(key)
+    def pop_list(*keys: str) -> List[str]:
+        for key in keys:
+            if key in parts:
+                return to_string_list(parts.pop(key))
+        return []
+
+    def pop_bool(key: str) -> Optional[bool]:
+        if key not in parts:
+            return None
+        value = parts.pop(key)
+        try:
+            return parse_optional_bool(value)
+        except ConfigError as exc:
+            raise ConfigError(f"--item {expr}: {exc}") from exc
+
+    search_term = parts.pop("search", None)
+    wear_filters = {normalize_wear(v) for v in pop_list("wears", "wear", "quality") if normalize_wear(v)}
+    weapon_values = pop_list("weapons", "weapon")
+    weapon_filters: Set[str] = set()
+    for value in weapon_values:
+        normalized = normalize_weapon(value)
+        if normalized:
+            weapon_filters.add(normalized.lower())
+    stattrak = pop_bool("stattrak")
+    souvenir = pop_bool("souvenir")
+    include_keywords = {kw.lower() for kw in pop_list("contains", "include")}
+    exclude_keywords = {kw.lower() for kw in pop_list("exclude", "excludes")}
+    dynamic_flag = pop_bool("dynamic")
+    exact_flag = pop_bool("exact_name")
     if parts:
         raise ConfigError(f"Неизвестные параметры у --item: {', '.join(parts.keys())}")
+    dynamic = bool(dynamic_flag) if dynamic_flag is not None else False
+    if name is None and not dynamic and not search_term:
+        raise ConfigError("--item должен содержать name=... или быть динамическим (--item dynamic=true;search=...)")
+    if search_term is None:
+        search_term = name
+    label = name or search_term or (", ".join(weapon_values) if weapon_values else "CLI Query")
+    if exact_flag is None:
+        exact_name = not dynamic
+    else:
+        exact_name = bool(exact_flag)
+    steam_name = name if not dynamic else None
     return ItemQuery(
-        market_hash_name=name,
+        market_hash_name=label,
         min_price=min_price,
         max_price=max_price,
         min_roi=min_roi,
         min_profit=min_profit,
         watch_markets=watch_markets,
         aliases=aliases,
+        search_term=search_term,
+        steam_name=steam_name,
+        exact_name=exact_name,
+        dynamic=dynamic,
+        wear_filters=wear_filters,
+        weapon_filters={w for w in weapon_filters if w},
+        stattrak=stattrak,
+        souvenir=souvenir,
+        include_keywords=include_keywords,
+        exclude_keywords=exclude_keywords,
     )
 
 
