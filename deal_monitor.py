@@ -11,7 +11,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import cloudscraper
 import requests
@@ -508,41 +508,59 @@ def _iter_items_recursive(value: Any, key_set: Set[str]):
 
 class SkinportFetcher(HTTPFetcher):
     name = "skinport"
-    API_URL = "https://api.skinport.com/v1/item"
+    API_URL = "https://api.skinport.com/v1/items"
+
+    def __init__(self, settings: Settings, config: Optional[Dict[str, Any]] = None):
+        super().__init__(settings, config)
+        # Skinport API требует поддержку Brotli.
+        self.session.headers.setdefault("Accept-Encoding", "gzip, deflate, br")
+        self.api_url = self.config.get("api_url", self.API_URL)
+        self.app_id = int(self.config.get("app_id", 730))
+        self._cached_items: Optional[List[Dict[str, Any]]] = None
+        self._cache_key: Optional[Tuple[Tuple[str, Any], ...]] = None
 
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
         params = {
-            "app_id": 730,
-            "market_hash_name": query.search_for(self.name),
+            "app_id": self.app_id,
             "currency": self.config.get("currency", self.settings.currency),
         }
         if self.config.get("tradable_only", True):
             params["tradable"] = 1
-        response = self.session.get(self.API_URL, params=params, timeout=self.settings.request_timeout)
-        if response.status_code == 404:
-            return []
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict) and "errors" in data:
-            raise RuntimeError(f"Skinport: {data['errors']}")
-        items = data if isinstance(data, list) else [data]
+        cache_enabled = bool(self.config.get("cache_items", True))
+        key = tuple(sorted(params.items()))
+        if not cache_enabled or self._cached_items is None or self._cache_key != key:
+            response = self.session.get(
+                self.api_url, params=params, timeout=self.settings.request_timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict) and "errors" in data:
+                raise RuntimeError(f"Skinport: {data['errors']}")
+            self._cached_items = data if isinstance(data, list) else []
+            self._cache_key = key
+        items = self._cached_items or []
         offers: List[MarketOffer] = []
         target = query.search_for(self.name).lower()
+        exact_target = target if query.exact_name else None
         for entry in items:
             raw_name = entry.get("market_hash_name") or entry.get("market_name") or ""
-            name = raw_name.lower()
-            if query.exact_name and name and name != target:
+            if not raw_name:
                 continue
-            if not query.exact_name and target and target not in name:
+            name_lower = raw_name.lower()
+            if exact_target:
+                if name_lower != exact_target:
+                    continue
+            elif target and target not in name_lower:
                 continue
-            price = coerce_float(entry.get("min_price") or entry.get("price"))
+            price = coerce_float(entry.get("min_price") or entry.get("price") or entry.get("mean_price"))
             if price is None:
                 continue
             adjusted = self.adjust_price(price)
-            offer_id = str(entry.get("item_id") or entry.get("market_hash_name"))
-            url = self.config.get("item_url_template", "https://skinport.com/item/{name}").format(
-                name=urllib.parse.quote(query.search_for(self.name))
-            )
+            offer_id = str(entry.get("item_id") or entry.get("market_hash_name") or name_lower)
+            url_template = self.config.get("item_url_template", entry.get("item_page"))
+            if not url_template:
+                url_template = "https://skinport.com/item/{name}"
+            url = url_template.format(name=urllib.parse.quote(query.search_for(self.name)))
             offers.append(
                 MarketOffer(
                     self.name,
@@ -553,11 +571,15 @@ class SkinportFetcher(HTTPFetcher):
                     quantity=entry.get("quantity"),
                     extra={
                         "suggested": coerce_float(entry.get("suggested_price")),
-                        "instant_sale": entry.get("instant_sale"),
+                        "median_price": coerce_float(entry.get("median_price")),
+                        "mean_price": coerce_float(entry.get("mean_price")),
                     },
                     raw=entry,
                 )
             )
+            # Если искали точное совпадение, достаточно первой записи.
+            if exact_target:
+                break
         return offers
 
 
