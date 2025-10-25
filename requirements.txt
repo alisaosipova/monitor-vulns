@@ -2,3 +2,4 @@ cloudscraper[brotli]>=1.2.71
 PyYAML>=6.0.1
 rich>=13.7.1
 requests>=2.31.0
+pytest>=8.3.2
