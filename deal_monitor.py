@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import html
 import logging
 import os
 import sys
 import time
 import urllib.parse
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable
 
 import cloudscraper
 import requests
@@ -506,210 +508,621 @@ def _iter_items_recursive(value: Any, key_set: Set[str]):
             yield from _iter_items_recursive(item, key_set)
 
 
+_SCRIPT_TAG_RE = re.compile(
+    r"<script(?P<attrs>[^>]*)>(?P<content>.*?)</script>", re.S | re.IGNORECASE
+)
+
+
+def extract_embedded_json(html_source: str, variable_names: Sequence[str]) -> List[Any]:
+    """Извлекает словари JSON из тегов <script> и присваиваний window.*."""
+
+    results: List[Any] = []
+    normalized_targets = {name.lower() for name in variable_names}
+
+    for match in _SCRIPT_TAG_RE.finditer(html_source):
+        attrs = match.group("attrs") or ""
+        content = html.unescape(match.group("content") or "").strip()
+        if not content:
+            continue
+        script_type = None
+        script_id = None
+        type_match = re.search(r'type="([^"]+)"', attrs, re.I)
+        if type_match:
+            script_type = type_match.group(1).lower()
+        id_match = re.search(r'id="([^"]+)"', attrs, re.I)
+        if id_match:
+            script_id = id_match.group(1).lower()
+        if script_type == "application/json" or (
+            script_id and script_id in normalized_targets
+        ):
+            try:
+                results.append(json.loads(content))
+                continue
+            except json.JSONDecodeError:
+                pass
+        for target in variable_names:
+            if target.lower() not in content.lower():
+                continue
+            json_candidate = _extract_json_from_assignment(content, target)
+            if json_candidate is not None:
+                results.append(json_candidate)
+                break
+
+    # В некоторых случаях присваивание может находиться вне тегов <script> (например, минимизированный HTML).
+    for target in variable_names:
+        candidate = _extract_json_from_assignment(html_source, target)
+        if candidate is not None:
+            results.append(candidate)
+    return results
+
+
+def _extract_json_from_assignment(source: str, variable: str) -> Optional[Any]:
+    assignment_pattern = re.compile(
+        rf"(?:window\.)?{re.escape(variable)}\s*=\s*(\{{.*?\}});",
+        re.S,
+    )
+    parse_pattern = re.compile(
+        rf"(?:window\.)?{re.escape(variable)}\s*=\s*JSON\.parse\((\".*?\")\)",
+        re.S,
+    )
+
+    assignment_match = assignment_pattern.search(source)
+    if assignment_match:
+        json_text = assignment_match.group(1)
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError:
+            pass
+    parse_match = parse_pattern.search(source)
+    if parse_match:
+        try:
+            encoded = json.loads(parse_match.group(1))
+        except json.JSONDecodeError:
+            return None
+        try:
+            return json.loads(encoded)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+_COMMON_LIST_KEYS = {
+    "items",
+    "listings",
+    "offers",
+    "sellOrders",
+    "lots",
+    "results",
+    "entries",
+    "nodes",
+    "data",
+    "edges",
+}
+
+_DICT_PRICE_KEYS = ("amount", "value", "min", "max", "price")
+_DIRECT_PRICE_KEYS = (
+    "price",
+    "price_usd",
+    "priceUsd",
+    "priceUSD",
+    "priceFloat",
+    "price_float",
+    "usdPrice",
+    "min_price",
+    "max_price",
+    "mean_price",
+    "current_price",
+    "median_price",
+    "suggested_price",
+    "sale_price",
+    "lowest_price",
+    "best_price",
+)
+_NESTED_PRICE_KEYS = ("pricing", "priceInfo", "price_info", "buyOrder")
+
+_NAME_KEYS = (
+    "market_hash_name",
+    "marketHashName",
+    "market_name",
+    "marketName",
+    "fullName",
+    "full_name",
+    "name",
+    "title",
+)
+
+_ID_KEYS = (
+    "id",
+    "offer_id",
+    "offerId",
+    "listingid",
+    "listingId",
+    "assetid",
+    "steamId",
+    "hash",
+    "slug",
+    "id64",
+    "item_id",
+)
+
+_QUANTITY_KEYS = ("quantity", "count", "amount", "available", "stock", "total")
+
+_URL_KEYS = (
+    "url",
+    "link",
+    "href",
+    "web_url",
+    "item_page",
+    "itemPage",
+    "page_url",
+    "pageUrl",
+)
+
+_EXTRA_FLOAT_KEYS = ("float", "floatValue", "wear", "float_value")
+_EXTRA_PATTERN_KEYS = ("phase", "pattern", "phaseName")
+_EXTRA_STICKERS_KEYS = ("stickers", "decals")
+
+
+def extract_offer_price(entry: Dict[str, Any]) -> Optional[float]:
+    candidate: Any = None
+    price_value = entry.get("price")
+    if isinstance(price_value, dict):
+        for key in _DICT_PRICE_KEYS:
+            if price_value.get(key) is not None:
+                candidate = price_value[key]
+                break
+    elif price_value is not None:
+        candidate = price_value
+    if candidate is None:
+        for key in _DIRECT_PRICE_KEYS:
+            if entry.get(key) is not None:
+                candidate = entry[key]
+                break
+    if candidate is None:
+        for nested_key in _NESTED_PRICE_KEYS:
+            nested = entry.get(nested_key)
+            if isinstance(nested, dict):
+                nested_value = extract_offer_price(nested)
+                if nested_value is not None:
+                    candidate = nested_value
+                    break
+    if candidate is None and isinstance(entry.get("item"), dict):
+        return extract_offer_price(entry["item"])
+    if candidate is None:
+        return None
+    value = coerce_float(candidate)
+    if value is None and isinstance(candidate, (int, float)):
+        value = float(candidate)
+    return value
+
+
+def extract_offer_name(entry: Dict[str, Any]) -> Optional[str]:
+    for key in _NAME_KEYS:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    item = entry.get("item")
+    if isinstance(item, dict):
+        return extract_offer_name(item)
+    return None
+
+
+def extract_offer_id(entry: Dict[str, Any], fallback: Optional[str] = None) -> str:
+    for key in _ID_KEYS:
+        value = entry.get(key)
+        if value:
+            return str(value)
+    item = entry.get("item")
+    if isinstance(item, dict):
+        nested = extract_offer_id(item, fallback)
+        if nested:
+            return nested
+    return str(fallback or "0")
+
+
+def extract_offer_quantity(entry: Dict[str, Any]) -> Optional[int]:
+    for key in _QUANTITY_KEYS:
+        value = entry.get(key)
+        if value is not None:
+            quantity = coerce_int(value)
+            if quantity is not None:
+                return quantity
+    item = entry.get("item")
+    if isinstance(item, dict):
+        return extract_offer_quantity(item)
+    return None
+
+
+def normalize_offer_url(
+    candidate: Optional[str], base_url: Optional[str], default_url: str
+) -> str:
+    if not candidate or not isinstance(candidate, str):
+        return default_url
+    url = candidate.strip()
+    if not url:
+        return default_url
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if base_url:
+        return urllib.parse.urljoin(base_url, url)
+    return default_url
+
+
+def extract_offer_url(
+    entry: Dict[str, Any], base_url: Optional[str], default_url: str
+) -> str:
+    for key in _URL_KEYS:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return normalize_offer_url(value, base_url, default_url)
+    item = entry.get("item")
+    if isinstance(item, dict):
+        return extract_offer_url(item, base_url, default_url)
+    return default_url
+
+
+def extract_offer_extra(entry: Dict[str, Any]) -> Dict[str, Any]:
+    item = entry.get("item") if isinstance(entry.get("item"), dict) else None
+    float_value = None
+    for key in _EXTRA_FLOAT_KEYS:
+        if entry.get(key) is not None:
+            float_value = entry[key]
+            break
+    if float_value is None and item:
+        for key in _EXTRA_FLOAT_KEYS:
+            if item.get(key) is not None:
+                float_value = item[key]
+                break
+    pattern = None
+    for key in _EXTRA_PATTERN_KEYS:
+        if entry.get(key) is not None:
+            pattern = entry[key]
+            break
+    if pattern is None and item:
+        for key in _EXTRA_PATTERN_KEYS:
+            if item.get(key) is not None:
+                pattern = item[key]
+                break
+    stickers = None
+    for key in _EXTRA_STICKERS_KEYS:
+        if entry.get(key) is not None:
+            stickers = entry[key]
+            break
+    if stickers is None and item:
+        for key in _EXTRA_STICKERS_KEYS:
+            if item.get(key) is not None:
+                stickers = item[key]
+                break
+    extra: Dict[str, Any] = {}
+    if float_value is not None:
+        extra["float"] = float_value
+    if pattern is not None:
+        extra["pattern"] = pattern
+    if stickers is not None:
+        extra["stickers"] = stickers
+    return extra
+
+
+def build_market_offers(
+    market: str,
+    entries: Iterable[Dict[str, Any]],
+    query: ItemQuery,
+    adjust_price: Callable[[float], float],
+    default_url: str,
+    base_url: Optional[str] = None,
+    expected_name: Optional[str] = None,
+) -> List[MarketOffer]:
+    offers: List[MarketOffer] = []
+    seen: Set[str] = set()
+    expected_lower = expected_name.lower() if expected_name else None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw_name = extract_offer_name(entry) or expected_name or query.market_hash_name
+        if not raw_name:
+            continue
+        name_lower = raw_name.lower()
+        if expected_lower and name_lower != expected_lower and expected_lower not in name_lower:
+            continue
+        if not query.matches_search(name_lower, market):
+            continue
+        price_value = extract_offer_price(entry)
+        if price_value is None:
+            continue
+        adjusted = adjust_price(price_value)
+        offer_id = extract_offer_id(entry, raw_name)
+        if offer_id in seen:
+            continue
+        seen.add(offer_id)
+        offer_url = extract_offer_url(entry, base_url, default_url)
+        quantity = extract_offer_quantity(entry)
+        extra = extract_offer_extra(entry)
+        offers.append(
+            MarketOffer(
+                market,
+                offer_id,
+                raw_name or query.market_hash_name,
+                adjusted,
+                offer_url,
+                quantity=quantity,
+                extra=extra,
+                raw=entry,
+            )
+        )
+    return offers
+
+
 class SkinportFetcher(HTTPFetcher):
     name = "skinport"
-    API_URL = "https://api.skinport.com/v1/items"
+    SEARCH_URL_TEMPLATE = "https://skinport.com/market/csgo?search={name}"
+
+    _SCRIPT_NAMES = (
+        "__NUXT__",
+        "__INITIAL_STATE__",
+        "__NEXT_DATA__",
+        "_post",
+        "__APOLLO_STATE__",
+        "__APOLLO_CACHE__",
+    )
 
     def __init__(self, settings: Settings, config: Optional[Dict[str, Any]] = None):
         super().__init__(settings, config)
-        # Skinport API требует поддержку Brotli.
-        self.session.headers["Accept-Encoding"] = self.config.get(
-            "accept_encoding", "gzip, deflate, br"
+        self.base_url = self.config.get("base_url", "https://skinport.com")
+        self.search_url_template = self.config.get(
+            "search_url_template", self.SEARCH_URL_TEMPLATE
         )
-        if "Accept" not in (self.config.get("headers") or {}):
-            self.session.headers.setdefault(
-                "Accept", "application/json, text/plain, */*"
-            )
-        self.api_url = self.config.get("api_url", self.API_URL)
-        self.app_id = int(self.config.get("app_id", 730))
-        self._cached_items: Optional[List[Dict[str, Any]]] = None
-        self._cache_key: Optional[Tuple[Tuple[str, Any], ...]] = None
+        self.item_url_template = self.config.get(
+            "item_url_template", self.search_url_template
+        )
 
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
-        params = {
-            "app_id": self.app_id,
-            "currency": self.config.get("currency", self.settings.currency),
-        }
-        if self.config.get("tradable_only", True):
-            params["tradable"] = 1
-        cache_enabled = bool(self.config.get("cache_items", True))
-        key = tuple(sorted(params.items()))
-        if not cache_enabled or self._cached_items is None or self._cache_key != key:
-            response = self.session.get(
-                self.api_url, params=params, timeout=self.settings.request_timeout
-            )
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, dict) and "errors" in data:
-                raise RuntimeError(f"Skinport: {data['errors']}")
-            self._cached_items = data if isinstance(data, list) else []
-            self._cache_key = key
-        items = self._cached_items or []
-        offers: List[MarketOffer] = []
-        target = query.search_for(self.name).lower()
-        exact_target = target if query.exact_name else None
-        for entry in items:
-            raw_name = entry.get("market_hash_name") or entry.get("market_name") or ""
-            if not raw_name:
-                continue
-            name_lower = raw_name.lower()
-            if exact_target:
-                if name_lower != exact_target:
-                    continue
-            elif target and target not in name_lower:
-                continue
-            price = coerce_float(entry.get("min_price") or entry.get("price") or entry.get("mean_price"))
-            if price is None:
-                continue
-            adjusted = self.adjust_price(price)
-            offer_id = str(entry.get("item_id") or entry.get("market_hash_name") or name_lower)
-            url_template = self.config.get("item_url_template", entry.get("item_page"))
-            if not url_template:
-                url_template = "https://skinport.com/item/{name}"
-            url = url_template.format(name=urllib.parse.quote(query.search_for(self.name)))
-            offers.append(
-                MarketOffer(
-                    self.name,
-                    offer_id,
-                    raw_name or query.market_hash_name,
-                    adjusted,
-                    url,
-                    quantity=entry.get("quantity"),
-                    extra={
-                        "suggested": coerce_float(entry.get("suggested_price")),
-                        "median_price": coerce_float(entry.get("median_price")),
-                        "mean_price": coerce_float(entry.get("mean_price")),
-                    },
-                    raw=entry,
-                )
-            )
-            # Если искали точное совпадение, достаточно первой записи.
-            if exact_target:
-                break
+        search_term = query.search_for(self.name)
+        if not search_term:
+            return []
+        url = self.search_url_template.format(name=urllib.parse.quote(search_term))
+        response = self.session.get(url, timeout=self.settings.request_timeout)
+        response.raise_for_status()
+        payloads = extract_embedded_json(response.text, self._SCRIPT_NAMES)
+        entries: List[Dict[str, Any]] = []
+        for payload in payloads:
+            for candidate in iter_items_by_keys(payload, _COMMON_LIST_KEYS):
+                if isinstance(candidate, list):
+                    entries.extend(candidate)
+        default_url = self.item_url_template.format(
+            name=urllib.parse.quote(search_term)
+        )
+        offers = build_market_offers(
+            self.name,
+            entries,
+            query,
+            self.adjust_price,
+            default_url,
+            base_url=self.base_url,
+            expected_name=query.name_for(self.name),
+        )
         return offers
-
 
 class CSGOMarketFetcher(HTTPFetcher):
     name = "market.csgo.com"
-    API_URL = "https://market.csgo.com/api/v2/search-list-items-by-hash-name-all"
+    ITEM_URL_TEMPLATE = "https://market.csgo.com/item/{name}"
+    SEARCH_URL_TEMPLATE = "https://market.csgo.com/?search={name}"
+    _SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.S | re.IGNORECASE)
 
     def __init__(self, settings: Settings, config: Optional[Dict[str, Any]] = None):
         super().__init__(settings, config)
-        self.api_key = self.config.get("api_key") or os.getenv("CSGO_MARKET_API_KEY")
-        if not self.api_key:
-            raise ConfigError(
-                "market.csgo.com требует API ключ (markets.market_csgo.api_key или переменная окружения CSGO_MARKET_API_KEY)."
-            )
-        self.config.setdefault("price_multiplier", 0.01)
+        self.config.setdefault("price_multiplier", 1.0)
+        self.item_url_template = self.config.get("item_url_template", self.ITEM_URL_TEMPLATE)
+        self.search_url_template = self.config.get(
+            "search_url_template", self.SEARCH_URL_TEMPLATE
+        )
 
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
-        params = {
-            "key": self.api_key,
-            "hash_name": query.name_for(self.name),
-            "page": 1,
-            "limit": self.config.get("limit", 60),
-        }
-        response = self.session.get(self.API_URL, params=params, timeout=self.settings.request_timeout)
+        target_name = query.name_for(self.name)
+        if not target_name:
+            return []
+        url = self.item_url_template.format(name=urllib.parse.quote(target_name))
+        response = self.session.get(url, timeout=self.settings.request_timeout)
         response.raise_for_status()
-        data = response.json()
-        if not data.get("success", False):
-            raise RuntimeError(f"market.csgo.com: {data.get('error') or data.get('message') or 'неизвестная ошибка'}")
-        items = data.get("items") or data.get("data") or []
-        offers: List[MarketOffer] = []
-        for entry in items:
-            raw_price = entry.get("price") or entry.get("price_usd") or entry.get("price_float")
-            price = coerce_float(raw_price)
-            if price is None:
+        offers = self._parse_offers_from_html(response.text, query, target_name)
+        if offers:
+            return offers
+        # Попытка использовать страницу поиска как запасной вариант.
+        search_url = self.search_url_template.format(
+            name=urllib.parse.quote(query.search_for(self.name))
+        )
+        if search_url != url:
+            fallback = self.session.get(search_url, timeout=self.settings.request_timeout)
+            if fallback.status_code == 200:
+                parsed = self._parse_offers_from_html(fallback.text, query, target_name)
+                if parsed:
+                    return parsed
+        return []
+
+    def _parse_offers_from_html(
+        self, html: str, query: ItemQuery, expected_name: str
+    ) -> List[MarketOffer]:
+        try:
+            payload = self._extract_json_payload(html)
+        except RuntimeError:
+            return []
+        offer_nodes = self._collect_offer_nodes(payload)
+        if not offer_nodes:
+            return []
+        default_url = self.item_url_template.format(
+            name=urllib.parse.quote(expected_name)
+        )
+        base_url = self.config.get("base_url")
+        return build_market_offers(
+            self.name,
+            offer_nodes,
+            query,
+            self.adjust_price,
+            default_url,
+            base_url=base_url,
+            expected_name=expected_name,
+        )
+
+    def _extract_json_payload(self, html: str) -> Dict[str, Any]:
+        for match in self._SCRIPT_RE.finditer(html):
+            content = match.group(1).strip()
+            if not content or not content.startswith("{"):
                 continue
-            adjusted = self.adjust_price(price)
-            offer_id = str(entry.get("id") or entry.get("assetid") or entry.get("classid") or entry.get("instanceid"))
-            url = entry.get("link") or self.config.get(
-                "item_url_template",
-                "https://market.csgo.com/item/{name}",
-            ).format(name=urllib.parse.quote(query.name_for(self.name)))
-            offers.append(
-                MarketOffer(
-                    self.name,
-                    offer_id,
-                    entry.get("market_hash_name") or query.market_hash_name,
-                    adjusted,
-                    url,
-                    quantity=entry.get("count") or entry.get("amount") or entry.get("total"),
-                    extra={
-                        "float": entry.get("float"),
-                        "phase": entry.get("phase"),
-                    },
-                    raw=entry,
-                )
-            )
-        return offers
+            if "apollo.cache.state" not in content and "apollo.store.state" not in content:
+                continue
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                continue
+        raise RuntimeError("market.csgo.com: не удалось извлечь JSON данные из HTML")
+
+    def _collect_offer_nodes(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        nodes: List[Dict[str, Any]] = []
+        for key in ("apollo.cache.state", "apollo.store.state"):
+            source = payload.get(key)
+            if not isinstance(source, dict):
+                continue
+            nodes.extend(self._dfs_collect_offer_nodes(source))
+        return nodes
+
+    def _dfs_collect_offer_nodes(self, value: Any) -> List[Dict[str, Any]]:
+        found: List[Dict[str, Any]] = []
+        stack: List[Any] = [value]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                edges = current.get("edges")
+                if isinstance(edges, list):
+                    for edge in edges:
+                        if not isinstance(edge, dict):
+                            continue
+                        node = edge.get("node")
+                        if isinstance(node, dict) and extract_offer_price(node) is not None:
+                            found.append(node)
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+        return found
 
 
 class SteamCommunityFetcher(HTTPFetcher):
     name = "steamcommunity.com"
-    LISTING_URL = "https://steamcommunity.com/market/listings/730/{name}/render"
+    LISTING_PAGE_URL = "https://steamcommunity.com/market/listings/730/{name}"
+    _LISTING_INFO_RE = re.compile(r"var\s+g_rgListingInfo\s*=\s*(\{.*?\});", re.S)
+    _ASSETS_RE = re.compile(r"g_rgAssets\s*=\s*(\{.*?\});", re.S)
 
     def __init__(self, settings: Settings, config: Optional[Dict[str, Any]] = None):
         super().__init__(settings, config)
-        self.currency_id = resolve_steam_currency_id(self.config.get("currency", settings.currency))
+        self.currency_id = resolve_steam_currency_id(
+            self.config.get("currency", settings.currency)
+        )
+        self.item_url_template = self.config.get(
+            "item_url_template",
+            "https://steamcommunity.com/market/listings/730/{name}",
+        )
 
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
         market_name = query.name_for(self.name)
         if not market_name:
             return []
-        params = {
-            "start": self.config.get("start", 0),
-            "count": self.config.get("count", 20),
-            "currency": self.currency_id,
-            "format": "json",
-        }
-        url = self.LISTING_URL.format(name=urllib.parse.quote(market_name))
+        params = {"currency": self.currency_id}
+        url = self.LISTING_PAGE_URL.format(name=urllib.parse.quote(market_name))
         response = self.session.get(url, params=params, timeout=self.settings.request_timeout)
         if response.status_code == 429:
             raise RuntimeError("steamcommunity.com: получен 429 (превышен лимит запросов)")
         response.raise_for_status()
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise RuntimeError("steamcommunity.com: некорректный JSON") from exc
-        if not data.get("success", True):
+        html = response.text
+        listing_info = self._extract_json_block(self._LISTING_INFO_RE, html)
+        if not listing_info:
             return []
-        listinginfo = data.get("listinginfo") or {}
+        assets = self._extract_json_block(self._ASSETS_RE, html)
+        asset_lookup = self._build_asset_lookup(assets)
+        default_url = self.item_url_template.format(
+            name=urllib.parse.quote(market_name)
+        )
         offers: List[MarketOffer] = []
-        for listing_id, info in listinginfo.items():
-            base_cents = coerce_int(info.get("converted_price_per_unit") or info.get("converted_price"))
-            fee_cents = coerce_int(info.get("converted_fee_per_unit") or info.get("converted_fee") or 0)
+        for listing_id, info in listing_info.items():
+            if not isinstance(info, dict):
+                continue
+            base_cents = coerce_int(
+                info.get("converted_price_per_unit") or info.get("converted_price")
+            )
             if base_cents is None:
                 continue
-            total_cents = base_cents + (fee_cents or 0)
+            fee_cents = coerce_int(
+                info.get("converted_fee_per_unit") or info.get("converted_fee") or 0
+            ) or 0
+            total_cents = base_cents + fee_cents
             price = self.adjust_price(total_cents / 100.0)
-            asset = info.get("asset") or {}
-            raw_name = (
-                asset.get("market_hash_name")
-                or asset.get("market_name")
-                or asset.get("name")
+            asset = self._resolve_asset(info.get("asset"), asset_lookup)
+            name = (
+                (asset or {}).get("market_hash_name")
+                or (asset or {}).get("market_name")
+                or (asset or {}).get("name")
                 or query.market_hash_name
             )
             offers.append(
                 MarketOffer(
                     self.name,
                     str(listing_id),
-                    raw_name,
+                    name,
                     price,
-                    self.config.get(
-                        "item_url_template",
-                        "https://steamcommunity.com/market/listings/730/{name}",
-                    ).format(name=urllib.parse.quote(market_name)),
+                    default_url,
                     quantity=coerce_int(info.get("quantity")),
                     extra={
-                        "original_amount": info.get("original_amount"),
-                        "asset": info.get("asset"),
+                        "asset": asset,
+                        "converted_price": base_cents,
+                        "converted_fee": fee_cents,
                     },
                     raw=info,
                 )
             )
         return offers
 
+    def _extract_json_block(self, pattern: re.Pattern, html: str) -> Dict[str, Any]:
+        match = pattern.search(html)
+        if not match:
+            return {}
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return {}
+
+    def _build_asset_lookup(
+        self, assets: Dict[str, Any]
+    ) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        lookup: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        if not isinstance(assets, dict):
+            return lookup
+        for appid, contexts in assets.items():
+            if not isinstance(contexts, dict):
+                continue
+            for contextid, items in contexts.items():
+                if not isinstance(items, dict):
+                    continue
+                for assetid, data in items.items():
+                    if not isinstance(data, dict):
+                        continue
+                    key = (
+                        str(data.get("appid") or appid),
+                        str(data.get("contextid") or contextid),
+                        str(data.get("id") or assetid),
+                    )
+                    lookup[key] = data
+        return lookup
+
+    def _resolve_asset(
+        self,
+        asset_info: Any,
+        lookup: Dict[Tuple[str, str, str], Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(asset_info, dict):
+            return None
+        appid = str(asset_info.get("appid") or asset_info.get("app_id") or "730")
+        contextid = str(asset_info.get("contextid") or asset_info.get("context_id") or "2")
+        assetid = str(asset_info.get("id") or asset_info.get("assetid") or "")
+        if not assetid:
+            return asset_info
+        return lookup.get((appid, contextid, assetid), asset_info)
 
 class LisSkinsFetcher(CloudflareFetcher):
     name = "lis-skins.com"
@@ -722,159 +1135,75 @@ class LisSkinsFetcher(CloudflareFetcher):
         if response.status_code != 200:
             raise RuntimeError(f"lis-skins.com вернул {response.status_code}")
         html = response.text
-        marker = '<script id="__NEXT_DATA__" type="application/json">'
-        start = html.find(marker)
-        if start == -1:
-            raise RuntimeError("lis-skins.com: не найден блок __NEXT_DATA__ (обновите headers/cookies).")
-        start += len(marker)
-        end = html.find("</script>", start)
-        if end == -1:
-            raise RuntimeError("lis-skins.com: не найден конец блока __NEXT_DATA__.")
-        payload = json.loads(html[start:end])
-        items: List[Dict[str, Any]] = []
-        for candidate in iter_items_by_keys(payload, {"items", "sellOrders", "lots"}):
-            if isinstance(candidate, list):
-                items.extend(candidate)
-        offers: List[MarketOffer] = []
-        seen: Set[str] = set()
-        for entry in items:
-            raw_name = entry.get("market_hash_name") or entry.get("fullName") or entry.get("name") or ""
-            name = raw_name.lower()
-            if not query.matches_search(name, self.name):
-                continue
-            price_value = entry.get("price") or entry.get("priceUsd") or entry.get("min_price")
-            price = coerce_float(price_value)
-            if price is None:
-                continue
-            adjusted = self.adjust_price(price)
-            offer_id = str(
-                entry.get("id")
-                or entry.get("_id")
-                or entry.get("assetid")
-                or entry.get("steamId")
-                or entry.get("hash")
-                or name
+        payloads = extract_embedded_json(
+            html,
+            ("__NEXT_DATA__", "__NUXT__", "__APOLLO_STATE__", "_post"),
+        )
+        if not payloads:
+            raise RuntimeError(
+                "lis-skins.com: не найден блок данных (обновите headers/cookies)."
             )
-            if offer_id in seen:
-                continue
-            seen.add(offer_id)
-            url = self.config.get(
-                "item_url_template",
-                "https://lis-skins.com/market/csgo?search={name}",
-            ).format(name=urllib.parse.quote(query.search_for(self.name)))
-            offers.append(
-                MarketOffer(
-                    self.name,
-                    offer_id,
-                    raw_name or query.market_hash_name,
-                    adjusted,
-                    url,
-                    quantity=entry.get("count") or entry.get("quantity") or entry.get("available"),
-                    extra={
-                        "float": entry.get("floatValue") or entry.get("wear"),
-                        "stickers": entry.get("stickers"),
-                    },
-                    raw=entry,
-                )
-            )
-        return offers
-
+        entries: List[Dict[str, Any]] = []
+        for payload in payloads:
+            for candidate in iter_items_by_keys(payload, _COMMON_LIST_KEYS):
+                if isinstance(candidate, list):
+                    entries.extend(candidate)
+        default_url = self.config.get(
+            "item_url_template",
+            "https://lis-skins.com/market/csgo?search={name}",
+        ).format(name=urllib.parse.quote(query.search_for(self.name)))
+        base_url = self.config.get("base_url", "https://lis-skins.com")
+        return build_market_offers(
+            self.name,
+            entries,
+            query,
+            self.adjust_price,
+            default_url,
+            base_url=base_url,
+            expected_name=query.name_for(self.name),
+        )
 
 class CSMoneyFetcher(CloudflareFetcher):
     name = "cs.money"
     supports_dynamic = True
 
     def fetch_offers(self, query: ItemQuery) -> List[MarketOffer]:
-        if api_url := self.config.get("api_url"):
-            return self._fetch_via_api(api_url, query)
         return self._fetch_via_page(query)
 
-    def _fetch_via_api(self, url: str, query: ItemQuery) -> List[MarketOffer]:
-        params = {
-            "limit": self.config.get("limit", 60),
-            "offset": 0,
-            "sort": self.config.get("sort", "price"),
-            "order": self.config.get("order", "asc"),
-            "search": query.search_for(self.name),
-        }
-        response = self.request("GET", url, params=params)
-        if response.status_code != 200:
-            raise RuntimeError(f"cs.money API вернул {response.status_code}")
-        data = response.json()
-        items = data.get("items") or data.get("sellOrders") or data.get("data") or []
-        return self._parse_items(items, query)
-
     def _fetch_via_page(self, query: ItemQuery) -> List[MarketOffer]:
-        page_url = self.config.get("page_url", "https://cs.money/csgo/trade")
+        page_url = self.config.get("page_url", "https://cs.money/market/csgo")
         params = {"search": query.search_for(self.name)}
         response = self.request("GET", page_url, params=params)
         if response.status_code != 200:
             raise RuntimeError(f"cs.money страница вернула {response.status_code}")
         html = response.text
-        marker = 'id="__NEXT_DATA__" type="application/json">'
-        start = html.find(marker)
-        if start == -1:
-            raise RuntimeError("cs.money: не удалось найти __NEXT_DATA__ (нужны свежие cookie/headers).")
-        start += len(marker)
-        end = html.find("</script>", start)
-        if end == -1:
-            raise RuntimeError("cs.money: повреждённый ответ, не найден </script>.")
-        payload = json.loads(html[start:end])
-        items: List[Dict[str, Any]] = []
-        for candidate in iter_items_by_keys(payload, {"items", "sellOrders", "list"}):
-            if isinstance(candidate, list):
-                items.extend(candidate)
-        return self._parse_items(items, query)
-
-    def _parse_items(self, items: List[Dict[str, Any]], query: ItemQuery) -> List[MarketOffer]:
-        offers: List[MarketOffer] = []
-        seen: Set[str] = set()
-        for entry in items:
-            raw_name = entry.get("market_hash_name") or entry.get("fullName") or entry.get("name") or ""
-            name = raw_name.lower()
-            if not query.matches_search(name, self.name):
-                continue
-            price_value = (
-                entry.get("price")
-                or entry.get("priceUsd")
-                or entry.get("priceUSD")
-                or (entry.get("price") or {}).get("usd")
+        payloads = extract_embedded_json(
+            html,
+            ("__NEXT_DATA__", "__NUXT__", "__APOLLO_STATE__", "_post"),
+        )
+        if not payloads:
+            raise RuntimeError(
+                "cs.money: не удалось найти данные (нужны свежие cookie/headers)."
             )
-            price = coerce_float(price_value)
-            if price is None:
-                continue
-            adjusted = self.adjust_price(price)
-            offer_id = str(
-                entry.get("id")
-                or entry.get("item_id")
-                or entry.get("assetid")
-                or entry.get("steamId")
-                or entry.get("id64")
-                or name
-            )
-            if offer_id in seen:
-                continue
-            seen.add(offer_id)
-            url = self.config.get(
-                "item_url_template",
-                "https://cs.money/csgo/trade/?search={name}",
-            ).format(name=urllib.parse.quote(query.name_for(self.name)))
-            offers.append(
-                MarketOffer(
-                    self.name,
-                    offer_id,
-                    raw_name or query.market_hash_name,
-                    adjusted,
-                    url,
-                    quantity=entry.get("count") or entry.get("available") or entry.get("amount"),
-                    extra={
-                        "float": entry.get("floatValue") or entry.get("wear"),
-                        "stickers": entry.get("stickers"),
-                    },
-                    raw=entry,
-                )
-            )
-        return offers
+        entries: List[Dict[str, Any]] = []
+        for payload in payloads:
+            for candidate in iter_items_by_keys(payload, _COMMON_LIST_KEYS):
+                if isinstance(candidate, list):
+                    entries.extend(candidate)
+        default_url = self.config.get(
+            "item_url_template",
+            "https://cs.money/market/csgo?search={name}",
+        ).format(name=urllib.parse.quote(query.name_for(self.name)))
+        base_url = self.config.get("base_url", "https://cs.money")
+        return build_market_offers(
+            self.name,
+            entries,
+            query,
+            self.adjust_price,
+            default_url,
+            base_url=base_url,
+            expected_name=query.name_for(self.name),
+        )
 
 
 class DealMonitor:
